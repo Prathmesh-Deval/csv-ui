@@ -1,0 +1,82 @@
+import os
+import pandas as pd
+import gradio as gr
+# from langchain.agents.agent_types import AgentType
+# # from langchain_community.llms import Ollama
+from langchain_community.chat_models import ChatOllama
+from langchain_experimental.agents import create_csv_agent,create_pandas_dataframe_agent
+import warnings
+from langchain.agents.agent_types import AgentType
+
+warnings.filterwarnings("ignore")
+
+
+llm = ChatOllama(
+    # model="mistral:7b-text-v0.2-q8_0",
+    model="mistral:7b-instruct-v0.3-q8_0",
+    # model="mistral:7b-instruct-q8_0",
+    temperature=0
+
+)
+print("\nLLM Loaded:", llm, "\n")
+
+def handle_file_and_question(uploaded_file, user_question):
+    if uploaded_file is None:
+        return "Please upload a CSV or Excel file to begin."
+
+    if uploaded_file.name.endswith(('.xlsx', '.xls')):
+        data = pd.read_excel(uploaded_file.name)
+        df = pd.DataFrame(data)
+        csv_file_path = os.path.join("temp.csv")
+        data.to_csv(csv_file_path, index=False)
+    else:
+        data = pd.read_csv(uploaded_file.name)
+        df = pd.DataFrame(data)
+        csv_file_path = uploaded_file.name
+    #
+    agent_executor = create_csv_agent(
+        llm,
+        csv_file_path,
+        verbose=True,
+        agent_type="openai-tools",
+        allow_dangerous_code=True
+    )
+
+    # agent_executor = create_pandas_dataframe_agent(
+    #     llm,
+    #     df,
+    #     agent_type=AgentType.OPENAI_FUNCTIONS,
+    #     verbose=True,
+    #     max_iterations=5,
+    #     early_stopping_method='generate',
+    #     allow_dangerous_code=True
+    # )
+
+
+
+    prompt = f"""
+        Please note:
+        - The data is loaded as a DataFrame named `df`.
+        - Do not use synthetic or fabricated data.
+        - Use the actual values from `df` when calculating counts or creating tables.
+        Please examine the data file and provide detailed results for the following request: {user_question}. 
+        Ensure the response includes specific data tables, counts, or raw data as requested, 
+        and format all outputs as tables for clarity and ease of analysis. All responses should be tabular."""
+
+
+    response = agent_executor.run(user_question)
+
+    return response
+
+iface = gr.Interface(
+    fn=handle_file_and_question,
+    inputs=[
+        gr.File(label="Upload CSV or Excel File"),
+        gr.Textbox(label="Ask a question about the data")
+    ],
+    outputs="text",
+    title="Nuclear Chatbot",
+    description="Upload a data file (CSV or Excel) and ask questions about the data."
+)
+
+iface.launch()
