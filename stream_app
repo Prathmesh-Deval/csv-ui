@@ -1,0 +1,430 @@
+import streamlit as st
+import pandas as pd
+import os
+import sqlite3
+from sqlalchemy import text
+
+from sqlalchemy import create_engine
+import sqlite3
+from transformers import AutoTokenizer
+from llama_index.core import SQLDatabase, Settings
+from llama_index.llms.llama_cpp import LlamaCPP
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.core.query_engine import NLSQLTableQueryEngine
+custom_css = """
+    <style>
+        .block-container {
+            max-width: 100%;
+            width: 100%;
+        }
+
+        .stFileUploader {
+            width: 100%;
+        }
+
+        .stTextInput>div>div>input {
+            width: 100%;
+        }
+
+        .stButton>button {
+            width: 200px;
+        }
+
+        .stDataFrame {
+            width: 100%;
+        }
+
+        .separator {
+            border-left: 2px solid #ccc;
+            background-color: white;
+            height: 100vh;
+            margin-top: 0;
+        }
+
+        .left-column {
+            width: 75%;
+        }
+
+        .right-column {
+            width: 25%;
+        }
+
+        .left-column, .right-column {
+            padding: 4px;
+        }
+
+        .centered-header {
+            text-align: center;
+        }
+
+        .separator-line {
+            border: 0;
+            height: 1px;
+            background-color: white;
+            margin-top: 10px;
+            margin-bottom: 20px;
+        }
+
+        .start-chat-button {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background-color: #4CAF50;
+            color: white;
+            width: 200px;
+            padding: 12px 0;
+            font-size: 16px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+
+        .start-chat-button:hover {
+            background-color: #45a049;
+        }
+
+        .chat-box {
+            width: 100%;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            height: 500px;
+            overflow-y: auto;
+        }
+
+        .chat-input {
+            width: 100%;
+            margin-top: 20px;
+            display: flex;
+        }
+
+        .chat-input input {
+            flex-grow: 1;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            margin-right: 10px;
+        }
+
+        .chat-input button {
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            background-color: #4CAF50;
+            color: white;
+            cursor: pointer;
+        }
+    </style>
+"""
+engine = create_engine('sqlite:///')
+filedb = sqlite3.connect('file:' + 'DATABASE.db' + '?mode=ro', uri=True)
+print("loading database to memory ...")
+filedb.backup(engine.raw_connection().driver_connection)
+print("loading database to memory ... done")
+filedb.close()
+with engine.connect() as con:
+    rows = con.execute(text("SELECT COUNT(*) from data"))
+    print(rows.all())
+
+tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.3")
+
+SHOW_LLM_CALL_TOKENS = True
+def messages_to_prompt(messages):
+    inst_buffer = []
+
+    prompt = ""
+
+    for message in messages:
+        if message.role == 'system' or message.role == 'user':
+            inst_buffer.append(str(message.content).strip())
+
+        elif message.role == 'assistant':
+            prompt += "[INST] " + "\n".join(inst_buffer) + " [/INST]"
+            prompt += " " + str(message.content).strip() + "</s>"
+            inst_buffer.clear()
+        else:
+            raise ValueError(f"Unknown message role {message.role}")
+
+    if len(inst_buffer) > 0:
+        prompt += "[INST] " + "\n".join(inst_buffer) + " [/INST]"
+
+
+
+def completion_to_prompt(completion):
+
+    return "[INST] " + str(completion).strip() + " [/INST]"
+
+
+llm = LlamaCPP(
+    model_path="C:\llm_weights\mistral-7b-instruct-v0.2.Q4_K_S.gguf",
+    temperature=0.1,
+    max_new_tokens=1024,
+    context_window=16348,  # max 32k
+    generate_kwargs={},
+    model_kwargs={"n_gpu_layers": -1},
+    messages_to_prompt=messages_to_prompt,
+    completion_to_prompt=completion_to_prompt,
+    verbose=False,
+)
+
+embed = HuggingFaceEmbedding(model_name="BAAI/bge-m3")
+
+Settings.llm = llm
+Settings.embed_model = embed
+Settings.tokenizer = tokenizer
+
+sql_database = SQLDatabase(engine, include_tables=["data"])
+
+
+query_engine = NLSQLTableQueryEngine(
+    sql_database=sql_database,
+    tables=["data"],
+    llm=llm,
+    embed_model=embed)
+
+
+st.markdown(custom_css, unsafe_allow_html=True)
+
+# Function to load file and extract insights
+def load_file(file):
+    try:
+        file_path = os.path.join("uploads", file.name)
+        os.makedirs("uploads", exist_ok=True)
+
+        with open(file_path, "wb") as f:
+            f.write(file.getbuffer())
+
+        if file.name.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        elif file.name.endswith(('.xls', '.xlsx')):
+            df = pd.read_excel(file_path)
+        else:
+            st.error("Unsupported file format. Please upload a CSV or Excel file.")
+            return None, None, None, None
+
+        file_size = os.path.getsize(file_path)
+        column_info = df.dtypes.to_frame().reset_index()
+        column_info.columns = ['Column Name', 'Data Type']
+        column_info['Non-Null Count'] = df.notnull().sum().values
+        column_info['Unique Count'] = df.nunique().values
+
+        insights = {
+            "File Size (in bytes)": file_size,
+            "Total Rows": len(df),
+            "Total Columns": len(df.columns)
+        }
+
+        return insights, column_info, df, file_path
+
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return None, None, None, None
+
+# Save CSV after editing
+def save_csv(df, file_name):
+    file_path = os.path.join("uploads", file_name)
+    df.to_csv(file_path, index=False)
+    return file_path
+
+# Convert DataFrame to SQL database
+def df_to_sql(df):
+    conn = sqlite3.connect(':memory:')  # In-memory DB for processing
+    df.to_sql('data', conn, index=False, if_exists='replace')
+    file_db = sqlite3.connect('DATABASE.db')  # Your database file
+    conn.backup(file_db)
+    file_db.close()
+    conn.close()
+    return 'DATABASE.db'
+#
+# # Initialize Llama model and setup query engine
+# def initialize_chatbot():
+#     engine = create_engine('sqlite:///')  # SQLite in-memory
+#     filedb = sqlite3.connect('file:' + 'DATABASE.db' + '?mode=ro', uri=True)
+#     filedb.backup(engine.raw_connection().driver_connection)
+#     filedb.close()
+#
+#     with engine.connect() as con:
+#         rows = con.execute(text("SELECT COUNT(*) from data"))
+#         print(rows.all())
+#
+#     tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.3")
+#
+#     llm = LlamaCPP(
+#         model_path="C:/llm_weights/mistral-7b-instruct-v0.2.Q4_K_S.gguf",
+#         temperature=0.1,
+#         max_new_tokens=1024,
+#         context_window=16348,  # max 32k
+#         generate_kwargs={},
+#         model_kwargs={"n_gpu_layers": -1},
+#         verbose=False,
+#     )
+#
+#     embed = HuggingFaceEmbedding(model_name="BAAI/bge-m3")
+#
+#     Settings.llm = llm
+#     Settings.embed_model = embed
+#     Settings.tokenizer = tokenizer
+#
+#     sql_database = SQLDatabase(engine, include_tables=["data"])
+#
+#     query_engine = NLSQLTableQueryEngine(
+#         sql_database=sql_database,
+#         tables=["data"],
+#         llm=llm,
+#         embed_model=embed
+#     )
+#     return query_engine
+#
+def ask_sk1(query):
+    try:
+        response = query_engine.query(query)
+
+        print(f"Question: \n{query}")
+        print(f"\nSQL Query used:\n{response.metadata['sql_query']}\n")
+        print(f"Answer: \n{response}\n")
+        return response
+
+    except Exception as e:
+        print(f"Error during query execution: {e}")
+# Main function with Streamlit UI
+def main():
+    # Ensure session_state is properly initialized for all variables
+    if 'chat_mode' not in st.session_state:
+        st.session_state.chat_mode = False
+
+    if 'df' not in st.session_state:
+        st.session_state.df = None
+        st.session_state.insights = None
+        st.session_state.column_info = None
+
+    if st.session_state.chat_mode:
+        # Chat Mode UI
+        st.title("Chat with Your Database")
+        st.markdown('<div class="chat-box">', unsafe_allow_html=True)
+
+        if 'messages' not in st.session_state:
+            st.session_state.messages = []
+
+        # Display conversation history
+        for msg in st.session_state.messages:
+            st.markdown(f"**{msg['role']}:** {msg['content']}")
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # User input form
+        with st.form(key="chat_input_form"):
+            user_input = st.text_input("What's on your mind?", key="user_input", placeholder="Ask something...")
+            submit_button = st.form_submit_button(label="Send")
+
+        if submit_button and user_input:
+            st.session_state.messages.append({"role": "User", "content": user_input})
+            # query_engine = initialize_chatbot(user_input)  # Initialize query engine for each query
+            response = ask_sk1(user_input)
+            st.session_state.messages.append({"role": "Chatbot", "content": str(response)})
+            st.rerun()
+
+    else:
+        # Not in chat mode, show file upload and insights page
+        st.markdown("<h1 class='centered-header'>KKL CSV AI AGENT</h1>", unsafe_allow_html=True)
+        st.markdown("<hr class='separator-line'>", unsafe_allow_html=True)
+
+        left_col, separator, right_col = st.columns([1, 0.01, 3])
+
+        with left_col:
+            st.header("Upload File and CSV Insights")
+            uploaded_file = st.file_uploader("Upload your CSV or Excel file", type=["csv", "xls", "xlsx"])
+
+            if uploaded_file is not None:
+                if st.session_state.df is None:
+                    insights, column_info, df, file_path = load_file(uploaded_file)
+
+                    if df is not None:
+                        st.session_state.df = df
+                        st.session_state.insights = insights
+                        st.session_state.column_info = column_info
+                        st.session_state.file_path = file_path
+
+                        st.success(f"File '{uploaded_file.name}' uploaded successfully.")
+
+                else:
+                    df = st.session_state.df
+                    insights = st.session_state.insights
+                    column_info = st.session_state.column_info
+                    file_path = st.session_state.file_path
+
+                st.subheader("File Insights")
+                st.write(insights)
+
+                st.write(f"File Size: {insights['File Size (in bytes)']} bytes")
+                st.write(f"Total Rows: {insights['Total Rows']}")
+                st.write(f"Total Columns: {insights['Total Columns']}")
+
+        with separator:
+            st.markdown("<div class='separator'></div>", unsafe_allow_html=True)
+
+        with right_col:
+            st.header("Update Column Names")
+            enable_editing = st.checkbox("Review and edit column names", value=False)
+
+            if 'updated_columns' not in st.session_state:
+                st.session_state.updated_columns = list(df.columns)
+
+            if enable_editing:
+                updated_column_names = st.session_state.updated_columns
+
+                st.subheader("Edit Column Names and Descriptions")
+
+                col1, col2, col3 = st.columns([3, 3, 4])
+                col1.write("**Existing Column Name**")
+                col2.write("**New Column Name**")
+                col3.write("**Description**")
+
+                for i, col in enumerate(updated_column_names):
+                    with st.container():
+                        col1, col2, col3 = st.columns([2, 2, 3])
+                        with col1:
+                            st.write(col)
+                        with col2:
+                            new_name = st.text_input(f"1", value=col, key=f"col_{i}", label_visibility="collapsed")
+                            updated_column_names[i] = new_name
+                        with col3:
+                            description = st.text_input(f"Description {i + 1}", key=f"desc_{i}", label_visibility="collapsed")
+
+                st.session_state.updated_columns = updated_column_names
+
+                if st.button("Save Changes"):
+                    df.columns = updated_column_names
+                    save_path = save_csv(df, "updated_file.csv")
+                    st.success(f"Updated file saved at: {save_path}")
+
+                    with open(save_path, "rb") as f:
+                        st.download_button(
+                            label="Download Updated CSV",
+                            data=f,
+                            file_name="updated_file.csv",
+                            mime="text/csv"
+                        )
+
+                    st.dataframe(df)
+
+            st.subheader("Original Column Insights")
+            st.dataframe(column_info)
+
+            st.subheader("Data")
+            st.dataframe(df.head())
+
+        # "Start Chat" Button (top-right corner)
+        st.markdown("<button class='start-chat-button'>Start Chat</button>", unsafe_allow_html=True)
+
+        # Handle button click to start chat
+        if st.button("Start Chat", key="start_chat"):
+            st.session_state.chat_mode = True
+            st.session_state.df_for_sql = st.session_state.df
+            df_to_sql(st.session_state.df)
+            st.rerun()
+
+if __name__ == "__main__":
+    main()
