@@ -1,0 +1,324 @@
+import base64
+import time
+import sqlite3
+from pathlib import Path
+from typing import Any
+import gradio as gr
+from fastapi import FastAPI
+from gradio.themes.utils.colors import slate
+from injector import inject, singleton
+import pandas as pd
+from transformers import AutoTokenizer
+from llama_index.core import SQLDatabase, Settings
+from llama_index.llms.llama_cpp import LlamaCPP
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.core.query_engine import NLSQLTableQueryEngine
+from sqlalchemy import create_engine, text
+
+UI_TAB_TITLE = "KKL PRIVATE GPT"
+AVATAR_BOT = Path(r"static\logo.jpg")
+AVATAR_BOT2 = Path(r"static\img.ico")
+
+MODES = ["Update Column Names", "Start Chat"]
+
+df = None
+db_connection = None
+
+
+def ask_db(query):
+    try:
+        print("Sending question to model")
+        response = query_engine.query(query)
+        return response
+
+    except Exception as e:
+        return f"Error during query execution: {e}"
+
+
+def process_file(file):
+    global df
+
+    if file.name.endswith('.csv'):
+        df = pd.read_csv(file.name)
+    elif file.name.endswith('.xlsx'):
+        df = pd.read_excel(file.name)
+    else:
+        return "Unsupported file format. Please upload a CSV or Excel file."
+
+    column_info = pd.DataFrame({
+        'Column Name': df.columns,
+        'Description': ['' for _ in df.columns]
+    })
+
+    return column_info
+
+
+def dummy_chat_response(message: str) -> str:
+    time.sleep(1)
+    return f"Dummy response to: {message}"
+
+
+import os
+
+
+def init_db():
+    global db_connection
+
+    if db_connection is None:
+
+        db_path = 'data.db'
+        if os.path.exists(db_path):
+            os.remove(db_path)
+            print(f"Existing database {db_path} has been deleted.")
+
+        db_connection = sqlite3.connect('data.db')
+        print("Database connection established.")
+    return db_connection
+
+
+def store_df_in_db(updated_df=None):
+    global df
+    global query_engine
+    global engine
+
+    print("\n*****UPDATING DB WITH DF:\n\n")
+    print(updated_df.head(10))
+
+    if updated_df is not None:
+        df = updated_df
+    conn = init_db()
+    cursor = conn.cursor()
+    print("\n*****UPDATING DB WITH DF22:\n\n")
+    print(updated_df.head(10))
+    time.sleep(3)
+
+    cursor.execute("CREATE TABLE IF NOT EXISTS data_table (" + ", ".join([f"{col} TEXT" for col in df.columns]) + ");")
+
+    # Insert rows into the table
+    rows = df.values.tolist()
+    cursor.executemany(
+        f"INSERT INTO data_table ({', '.join(df.columns)}) VALUES ({', '.join(['?'] * len(df.columns))})", rows)
+
+    # Commit changes and print count for debugging
+    conn.commit()
+    cursor.execute("SELECT COUNT(*) FROM data_table")
+    row_count = cursor.fetchone()[0]
+
+    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.3")
+
+    llm = LlamaCPP(
+        model_path=r"mistral-7b-instruct-v0.3-q8_0.gguf",
+        temperature=0.1,
+        max_new_tokens=1024,
+        context_window=16348,
+        model_kwargs={"n_gpu_layers": -1},
+        verbose=False
+    )
+
+    embed = HuggingFaceEmbedding(model_name="BAAI/bge-m3")
+
+    Settings.llm = llm
+    Settings.embed_model = embed
+    Settings.tokenizer = tokenizer
+
+    engine = create_engine(f"sqlite:///data.db")
+
+    sql_database = SQLDatabase(engine, include_tables=["data_table"])
+
+    query_engine = NLSQLTableQueryEngine(
+        sql_database=sql_database,
+        tables=["data_table"],
+        llm=llm,
+        embed_model=embed
+    )
+
+    count_query = "SELECT COUNT(*) FROM data_table;"
+    print("Querying normally")
+    with engine.connect() as connection:
+        result = connection.execute(text(count_query))
+        count_result = result.fetchone()[0]  # Fetch the first row, and get the count
+    print("\n#######FETCHED:", count_result, "\n")
+
+    print(f"\n*******************************LLM LOADED : \nRow count in database earlier: {row_count}\n")
+
+    return row_count
+
+
+@singleton
+class PrivateGptUi:
+    @inject
+    def __init__(self) -> None:
+        self._system_prompt = "This is the system prompt."
+        self._selected_filename = None
+        self.updated_columns = []
+        self.updated_descriptions = []
+        self.is_file_loaded = False
+
+    def _chat(self, message: str, history: list[list[str]], mode: str, *_: Any) -> Any:
+        response = ask_db(message)
+        return response.text if hasattr(response, 'text') else str(response)
+
+    def _set_current_mode(self, mode: str) -> Any:
+        self._system_prompt = f"System prompt updated for mode: {mode}"
+
+        if mode == "Update Column Names":
+            return [
+                gr.update(visible=True),
+                gr.update(visible=False),
+                gr.update(placeholder=self._system_prompt, interactive=True)
+            ]
+        else:
+
+            store_df_in_db(updated_df=df if not self.updated_columns else pd.DataFrame(
+                data=df.values, columns=self.updated_columns))
+
+            return [
+                gr.update(visible=False),
+                gr.update(visible=True),
+                gr.update(placeholder=self._system_prompt, interactive=True)
+            ]
+
+    def _save_column_updates(self, updated_df):
+        global df
+
+        updated_columns = updated_df['Column Name'].tolist()
+        updated_descriptions = updated_df['Description'].tolist()
+
+        print("Updated Column Names:", updated_columns)
+        print("Updated Descriptions:", updated_descriptions)
+
+        df.columns = updated_columns
+
+        print("Updated DataFrame:")
+        print(df)
+
+        return f"DataFrame updated successfully!"
+
+    def _build_ui_blocks(self) -> gr.Blocks:
+        with gr.Blocks(
+                title=UI_TAB_TITLE,
+                theme=gr.themes.Soft(primary_hue=slate),
+                css=""" 
+                body, .gradio-container {
+                        font-family: Arial, Helvetica, sans-serif;
+                }
+                .logo { 
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100px;
+                    background-color: #00538C;
+
+                }
+                .logo img { 
+                    height: 60%; 
+                    border-radius: 8px;
+                }
+                .header-ico {
+                    height: 20px;
+                    background-color: antiquewhite;
+                    border-radius: 2px;
+                    margin-right: 20px;
+                }
+                /* Custom CSS for the Save Button */
+                .save-btn {
+                    background-color: #28a745; /* Green */
+                    color: white;
+                    border-radius: 5px;
+                    padding: 6px 12px; /* Small button */
+                    font-size: 12px;
+                    cursor: pointer;
+                    width: auto; /* Make the button only as wide as its content */
+                    margin-left: auto; /* Center the button horizontally within its container */
+                    # display: block; /* Ensures it behaves as a block-level element */
+                }
+                .save-btn:hover {
+                    background-color: #218838; /* Darker green on hover */
+                }
+                .success-msg {
+                    color: green;          /* Font color set to green */
+                    font-size: 12px;       /* Font size set to 12px */
+                    width: 20%;            /* Control the width of the textbox */
+                    height: 50px;
+                    margin-left: 80%;      /* Align the textbox towards the right (adjust as needed) */
+                    text-align: center;    /* Center the text inside the box */
+
+                }
+
+            """
+        ) as blocks:
+            avatar_byte = AVATAR_BOT.read_bytes()
+            f_base64 = f"data:image/png;base64,{base64.b64encode(avatar_byte).decode('utf-8')}"
+            gr.HTML(f"""
+                <div class='logo'>
+                    <img class='header-ico' src='{f_base64}'>
+                    <h1 style="color: white;">KKL PRIVATE GPT</h1>  <!-- Title with white color -->
+                </div>
+            """)
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=3):
+                    mode = gr.Radio(MODES, label="Mode", value="Update Column Names", interactive=False)
+                    explanation_mode = gr.Textbox(
+                        placeholder="Get contextualized answers from selected files.",
+                        show_label=False,
+                        max_lines=3,
+                        interactive=False,
+                    )
+
+                    with gr.Column(visible=True) as csv_mode:
+                        file_input = gr.File(label="Upload CSV/Excel File")
+                        df_output = gr.Dataframe(headers=["Column Name", "Description"], type="pandas",
+                                                 interactive=True)
+                        save_button = gr.Button("Save Updated Columns", elem_classes=["save-btn"])
+
+                        iface = gr.Interface(
+                            fn=process_file,
+                            inputs=file_input,
+                            outputs=df_output,
+                            live=True,
+                            flagging_mode="never",
+                            clear_btn=None,
+                            fill_width=True,
+                            theme="soft"
+                        )
+
+                        save_button.click(self._save_column_updates, inputs=df_output)
+
+                        file_input.upload(self._on_file_uploaded, inputs=file_input, outputs=[mode])
+
+                    with gr.Column(visible=False) as chat_mode:
+                        label_text = f"LLM: Mistral:7b-instruct-v0.3-q8_0"
+                        _ = gr.ChatInterface(
+                            self._chat,
+                            chatbot=gr.Chatbot(
+                                label=label_text,
+                                show_copy_button=True,
+                                elem_id="chatbot",
+                                render=False,
+                                avatar_images=(None, AVATAR_BOT2),
+                            ),
+                            additional_inputs=[mode],
+                        )
+
+            mode.change(self._set_current_mode, inputs=mode, outputs=[csv_mode, chat_mode, explanation_mode])
+
+        return blocks
+
+    def _on_file_uploaded(self, file: gr.File) -> gr.update:
+        self.is_file_loaded = True
+        return gr.update(interactive=True)
+
+    def get_ui_blocks(self) -> gr.Blocks:
+        return self._build_ui_blocks()
+
+    def mount_in_app(self, app: FastAPI, path: str) -> None:
+        blocks = self.get_ui_blocks()
+        blocks.queue()
+        gr.mount_gradio_app(app, blocks, path=path, favicon_path=AVATAR_BOT)
+
+
+if __name__ == "__main__":
+    ui = PrivateGptUi()
+    _blocks = ui.get_ui_blocks()
+    _blocks.queue()
+    _blocks.launch(debug=False)
